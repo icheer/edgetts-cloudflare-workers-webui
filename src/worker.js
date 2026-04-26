@@ -35,7 +35,7 @@ const OPENAI_VOICE_MAP = {
   "echo": "zh-CN-liaoning-XiaobeiNeural" // 东北女声 -> 晓北
 };
 
-const htmlContent = getHtmlContent();
+let htmlContent = null; // 懒初始化，避免冷启动时占用内存
 
 // =================================================================================
 // 主事件监听器
@@ -59,6 +59,7 @@ async function handleRequest(event) {
   const url = new URL(request.url);
   // 处理HTML页面请求
   if (url.pathname === '/' || url.pathname === '/index.html') {
+    if (!htmlContent) htmlContent = getHtmlContent();
     return new Response(htmlContent, {
       headers: {
         "Content-Type": "text/html;charset=UTF-8",
@@ -120,16 +121,17 @@ async function handleSpeechRequest(request) {
 
   // 解析请求参数并设置默认值
   const {
-    model = "tts-1",                    // 模型名称
-    input,                              // 输入文本
-    voice = "shimmer",                  // 语音
-    speed = 1.0,                        // 语速 (0.25-2.0)
-    pitch = 1.0,                        // 音调 (0.5-1.5)
-    style = "general",                  // 语音风格
-    stream = false,                     // 是否流式输出
-    concurrency = DEFAULT_CONCURRENCY, // 并发数
-    chunk_size = DEFAULT_CHUNK_SIZE,    // 分块大小
-    cleaning_options = {}               // 文本清理选项
+    model = "tts-1",                     // 模型名称
+    input,                               // 输入文本
+    voice = null,                        // 语音（OpenAI 别名或微软语音名）
+    response_format = "mp3",             // 输出格式
+    speed = 1.0,                         // 语速 (0.25-2.0)
+    pitch = 1.0,                         // 音调 (0.5-1.5)
+    style = "general",                   // 语音风格
+    stream = false,                      // 是否流式输出
+    concurrency = DEFAULT_CONCURRENCY,   // 并发数
+    chunk_size = DEFAULT_CHUNK_SIZE,     // 分块大小
+    cleaning_options = {}                // 文本清理选项
   } = requestBody;
 
   // 合并默认清理选项
@@ -146,17 +148,25 @@ async function handleSpeechRequest(request) {
   // 清理输入文本
   const cleanedInput = cleanText(input, finalCleaningOptions);
 
-  // 语音映射处理
-  const modelVoice = !voice ? OPENAI_VOICE_MAP[model.replace('tts-1-', '')] : null;
-  const finalVoice = modelVoice || voice;
-  if (!finalVoice) {
-    return errorResponse("无效的语音模型", 400, "invalid_request_error");
-  }
+  // 语音映射：voice 别名 > model 中编码的别名 > voice 直接作为微软语音名 > 默认值
+  const modelAlias = model.replace(/^tts-1-?/, '') || null;
+  const finalVoice = OPENAI_VOICE_MAP[voice]
+    || OPENAI_VOICE_MAP[modelAlias]
+    || voice
+    || "zh-CN-XiaoxiaoNeural";
+
+  // response_format -> 微软 outputFormat + Content-Type
+  const FORMAT_MAP = {
+    "mp3":  { fmt: "audio-24khz-48kbitrate-mono-mp3",  ct: "audio/mpeg" },
+    "opus": { fmt: "webm-24khz-16bit-mono-opus",        ct: "audio/webm" },
+    "wav":  { fmt: "riff-24khz-16bit-mono-pcm",         ct: "audio/wav"  },
+    "pcm":  { fmt: "raw-24khz-16bit-mono-pcm",          ct: "audio/pcm"  },
+  };
+  const { fmt: outputFormat, ct: contentType } = FORMAT_MAP[response_format] ?? FORMAT_MAP["mp3"];
 
   // 参数转换为 Microsoft TTS 格式
-  const rate = ((speed - 1) * 100).toFixed(0);        // 语速转换
-  const finalPitch = ((pitch - 1) * 100).toFixed(0);  // 音调转换
-  const outputFormat = "audio-24khz-48kbitrate-mono-mp3"; // 输出格式
+  const rate = ((speed - 1) * 100).toFixed(0);
+  const finalPitch = ((pitch - 1) * 100).toFixed(0);
 
   // 智能文本分块
   const textChunks = smartChunkText(cleanedInput, chunk_size);
@@ -164,9 +174,9 @@ async function handleSpeechRequest(request) {
 
   // 根据是否流式选择处理方式
   if (stream) {
-    return await streamVoice(textChunks, concurrency, ...ttsArgs);
+    return streamVoice(textChunks, concurrency, contentType, ...ttsArgs);
   } else {
-    return await getVoice(textChunks, concurrency, ...ttsArgs);
+    return await getVoice(textChunks, concurrency, contentType, ...ttsArgs);
   }
 }
 
@@ -175,13 +185,14 @@ async function handleSpeechRequest(request) {
  * @returns {Response} 可用模型列表
  */
 function handleModelsRequest() {
+  const CREATED_AT = 1706745600; // 固定 Unix 时间戳（秒），符合 OpenAI 规范
   const models = [
-    { id: 'tts-1', object: 'model', created: Date.now(), owned_by: 'openai' },
-    { id: 'tts-1-hd', object: 'model', created: Date.now(), owned_by: 'openai' },
+    { id: 'tts-1',    object: 'model', created: CREATED_AT, owned_by: 'openai' },
+    { id: 'tts-1-hd', object: 'model', created: CREATED_AT, owned_by: 'openai' },
     ...Object.keys(OPENAI_VOICE_MAP).map(v => ({
       id: `tts-1-${v}`,
       object: 'model',
-      created: Date.now(),
+      created: CREATED_AT,
       owned_by: 'openai'
     }))
   ];
@@ -198,21 +209,18 @@ function handleModelsRequest() {
  * 流式语音生成
  * @param {string[]} textChunks - 文本块数组
  * @param {number} concurrency - 并发数
+ * @param {string} contentType - 响应 Content-Type
  * @param {...any} ttsArgs - TTS 参数
- * @returns {Promise<Response>} 流式音频响应
+ * @returns {Response} 流式音频响应
  */
-async function streamVoice(textChunks, concurrency, ...ttsArgs) {
+function streamVoice(textChunks, concurrency, contentType, ...ttsArgs) {
   const { readable, writable } = new TransformStream();
-  try {
-    // 等待流式管道完成以便捕获错误
-    await pipeChunksToStream(writable.getWriter(), textChunks, concurrency, ...ttsArgs);
-    return new Response(readable, {
-      headers: { "Content-Type": "audio/mpeg", ...makeCORSHeaders() }
-    });
-  } catch (error) {
-    console.error("流式 TTS 失败:", error);
-    return errorResponse(error.message, 500, "tts_generation_error");
-  }
+  // 不 await——立即返回 Response，pipe 在后台并发执行
+  pipeChunksToStream(writable.getWriter(), textChunks, concurrency, ...ttsArgs)
+    .catch(err => console.error("流式 TTS 失败:", err));
+  return new Response(readable, {
+    headers: { "Content-Type": contentType, ...makeCORSHeaders() }
+  });
 }
 
 /**
@@ -251,10 +259,11 @@ async function pipeChunksToStream(writer, chunks, concurrency, ...ttsArgs) {
  * 非流式语音生成
  * @param {string[]} textChunks - 文本块数组
  * @param {number} concurrency - 并发数
+ * @param {string} contentType - 响应 Content-Type
  * @param {...any} ttsArgs - TTS 参数
  * @returns {Promise<Response>} 完整音频响应
  */
-async function getVoice(textChunks, concurrency, ...ttsArgs) {
+async function getVoice(textChunks, concurrency, contentType, ...ttsArgs) {
   const allAudioBlobs = [];
   try {
     // 非流式模式也使用批处理
@@ -268,9 +277,9 @@ async function getVoice(textChunks, concurrency, ...ttsArgs) {
     }
 
     // 合并所有音频数据
-    const concatenatedAudio = new Blob(allAudioBlobs, { type: 'audio/mpeg' });
+    const concatenatedAudio = new Blob(allAudioBlobs, { type: contentType });
     return new Response(concatenatedAudio, {
-      headers: { "Content-Type": "audio/mpeg", ...makeCORSHeaders() }
+      headers: { "Content-Type": contentType, ...makeCORSHeaders() }
     });
   } catch (error) {
     console.error("非流式 TTS 失败:", error);
@@ -401,9 +410,9 @@ async function sign(urlStr) {
   const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
 
   // 解码密钥并生成 HMAC 签名
-  const decode = await base64ToBytes("oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==");
+  const decode = base64ToBytes("oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==");
   const signData = await hmacSha256(decode, bytesToSign);
-  const signBase64 = await bytesToBase64(signData);
+  const signBase64 = bytesToBase64(signData);
 
   return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
 }
@@ -428,10 +437,8 @@ async function hmacSha256(key, data) {
 
 /**
  * Base64 字符串转字节数组
- * @param {string} base64 - Base64 字符串
- * @returns {Promise<Uint8Array>} 字节数组
  */
-async function base64ToBytes(base64) {
+function base64ToBytes(base64) {
   const binaryString = atob(base64);
   const bytes = new Uint8Array(binaryString.length);
   for (let i = 0; i < binaryString.length; i++) {
@@ -442,10 +449,8 @@ async function base64ToBytes(base64) {
 
 /**
  * 字节数组转 Base64 字符串
- * @param {Uint8Array} bytes - 字节数组
- * @returns {Promise<string>} Base64 字符串
  */
-async function bytesToBase64(bytes) {
+function bytesToBase64(bytes) {
   return btoa(String.fromCharCode.apply(null, bytes));
 }
 
